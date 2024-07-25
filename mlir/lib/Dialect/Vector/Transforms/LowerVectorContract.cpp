@@ -14,6 +14,7 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -253,6 +254,38 @@ private:
   FilterConstraintType filter;
 };
 
+/// a hack about lowering 'vector.contract %a, %b, %c' into v_dot4c_i32_i8
+class ContractionOpToVdotIntrinsicOpLowering
+    : public MaskableOpRewritePattern<vector::ContractionOp> {
+
+public:
+  using MaskableOpRewritePattern::MaskableOpRewritePattern;
+
+  using FilterConstraintType =
+      std::function<LogicalResult(vector::ContractionOp op)>;
+
+  static LogicalResult defaultFilter(vector::ContractionOp op) {
+    return success();
+  }
+
+  ContractionOpToVdotIntrinsicOpLowering(
+      vector::VectorTransformsOptions vectorTransformOptions,
+      MLIRContext *context, PatternBenefit benefit = 1,
+      FilterConstraintType constraint = defaultFilter)
+      : MaskableOpRewritePattern<vector::ContractionOp>(context, benefit),
+        vectorTransformOptions(vectorTransformOptions),
+        filter(std::move(constraint)) {}
+
+  FailureOr<Value>
+  matchAndRewriteMaskableOp(vector::ContractionOp op, MaskingOpInterface maskOp,
+                            PatternRewriter &rewriter) const override;
+
+private:
+  /// Options to control the vector patterns.
+  vector::VectorTransformsOptions vectorTransformOptions;
+  FilterConstraintType filter;
+};
+
 /// Progressive lowering of a `vector.contract %a, %b, %c` with row-major matmul
 /// semantics to a reduction_size-unrolled sequence:
 /// ```
@@ -392,6 +425,134 @@ private:
   // Lower one reduction dimension.
   FailureOr<Value> lowerReduction(PatternRewriter &rewriter,
                                   vector::ContractionOp op, Value mask) const;
+};
+
+/// Generate a vector implementation of matvec
+/// This unrolls inner-product long the parallel dimension
+struct UnrolledInnerProductGenerator
+    : public StructuredGenerator<vector::ContractionOp, vector::IteratorType> {
+  UnrolledInnerProductGenerator(RewriterBase &b, vector::ContractionOp op)
+      : StructuredGenerator<vector::ContractionOp, vector::IteratorType>(b, op),
+        kind(op.getKind()), lhs(op.getLhs()), rhs(op.getRhs()),
+        res(op.getAcc()), lhsType(op.getLhsType()) {
+    auto maskableOp = cast<MaskableOpInterface>(op.getOperation());
+    if (maskableOp.isMasked())
+      mask = maskableOp.getMaskingOp().getMask();
+  }
+
+  Value t(Value v, ArrayRef<int64_t> perm = {1, 0}) {
+    if (!v)
+      return v;
+    return rewriter.create<vector::TransposeOp>(loc, v, perm);
+  }
+
+  std::optional<int64_t> getDimSize(VectorType vecType, int64_t Dim) {
+    // Cannot unroll scalable dimension
+    if (vecType.getScalableDims()[Dim])
+      return std::nullopt;
+
+    int64_t parallelSize = vecType.getDimSize(Dim);
+    assert(parallelSize > 0 &&
+           "Parallel dim must be a known static size to allow unrolling");
+    return parallelSize;
+  }
+
+  FailureOr<Value> rewriteI8VectorintoI32(Value input) {
+    VectorType inputVecType = cast<VectorType>(input.getType());
+    assert(inputVecType.getElementType().isSignlessInteger(8) &&
+           "Expected i8 signless type");
+    // assert(inputVecType.getElementType().isSignedInteger(8) &&
+    //        "Expected i8 signed type");
+    constexpr int64_t i8Toi32BitwidthFactor = 4;
+    SmallVector<int64_t> i32VecShape = llvm::to_vector(inputVecType.getShape());
+    if (i32VecShape.size() != 1)
+      return failure();
+    i32VecShape.back() = i32VecShape.back() / i8Toi32BitwidthFactor;
+    auto i32VecType = VectorType::get(i32VecShape, rewriter.getI32Type());
+    if (i32VecType.getNumElements() != 1 || i32VecType.getRank() != 1)
+      return failure();
+    Value i32Vector =
+        rewriter.create<vector::BitCastOp>(loc, i32VecType, input);
+    Value retI32 = rewriter.create<vector::ExtractOp>(loc, i32Vector, 0);
+    return retI32;
+  }
+
+  FailureOr<Value> innerProd(Value lhs, Value rhs, Value res,
+                             VectorType lhsType, int parallelSize) {
+    Type resElementType = cast<VectorType>(res.getType()).getElementType();
+
+    FailureOr<Value> lhs_Int32 = rewriteI8VectorintoI32(lhs);
+
+    if (failed(lhs_Int32))
+      return failure();
+
+    if (parallelSize != 4)
+      return failure();
+
+    for (int64_t k = 0; k < parallelSize; ++k) {
+      Value extractB = rewriter.create<vector::ExtractOp>(loc, rhs, k);
+      FailureOr<Value> rhs_Int32 = rewriteI8VectorintoI32(extractB);
+      if (failed(rhs_Int32))
+        return failure();
+      Value extractC = rewriter.create<vector::ExtractOp>(loc, res, k);
+
+      auto opName = rewriter.getStringAttr("llvm.amdgcn.sdot4");
+      Type i1Type = rewriter.getI1Type(); // 1-bit integer type
+      Value clampValue = rewriter.create<LLVM::ConstantOp>(
+          loc, i1Type,
+          rewriter.getIntegerAttr(i1Type, 0)); // Example with clamp = 1
+
+      auto dotIntrisic = rewriter.create<LLVM::CallIntrinsicOp>(
+          loc, resElementType, opName,
+          ArrayRef<Value>({*lhs_Int32, *rhs_Int32, extractC, clampValue}));
+
+      res = rewriter.create<vector::InsertOp>(loc, dotIntrisic.getResult(0),
+                                              res, SmallVector<int64_t>{k});
+    }
+    return res;
+  }
+  //
+  // One outer parallel, one inner reduction (matvec flavor).
+  // Mask is not supported right now,
+  // Unrolling along parallel dimension and generate intrinsic for each
+  // iteration.
+  //
+  FailureOr<Value> matvec() {
+    if (!iters({Par(), Red()}))
+      return failure();
+
+    AffineExpr m, k;
+    bindDims(rewriter.getContext(), m, k);
+
+    // not support mask case now.
+    if (mask)
+      return failure();
+
+    Type inputElementType = cast<VectorType>(lhsType).getElementType();
+    Type resElementType = cast<VectorType>(res.getType()).getElementType();
+
+    VectorType rhsType = cast<VectorType>(rhs.getType());
+    // Case vec-mat-trans: swap and ready to go.
+    // This is also the case from sdxl, in which we want to try
+    // the intrinsic hack.
+    if (layout({{k}, {k, m}, {m}})) {
+      if (inputElementType.isInteger(8) && resElementType.isInteger(32)) {
+        auto reductionSize = getDimSize(rhsType, 0);
+        if (reductionSize != 4)
+          return failure();
+        constexpr int64_t i8Toi32BitwidthFactor = 4;
+        if (auto parallelSize = getDimSize(rhsType, 1)) {
+          Value tRhs = t(rhs);
+          return innerProd(lhs, tRhs, res, lhsType, *parallelSize);
+        }
+      }
+    }
+  }
+
+private:
+  vector::CombiningKind kind;
+  Value lhs, rhs, res, mask;
+  VectorType lhsType;
 };
 
 /// Generate a vector implementation for matmat, matvec and tmatvec.
@@ -621,6 +782,31 @@ private:
   Value lhs, rhs, res, mask;
   VectorType lhsType;
 };
+
+FailureOr<Value>
+ContractionOpToVdotIntrinsicOpLowering::matchAndRewriteMaskableOp(
+    vector::ContractionOp op, MaskingOpInterface maskOp,
+    PatternRewriter &rewriter) const {
+
+  // auto gpuTargetAttr = getGPUTargetAttr(op);
+  // llvm::dbgs() << gpuTargetAttr << "\n";
+
+  if (vectorTransformOptions.vectorContractLowering !=
+      vector::VectorContractLowering::OuterProduct)
+    return failure();
+
+  if (failed(filter(op)))
+    return failure();
+
+  UnrolledInnerProductGenerator e(rewriter, op);
+
+  FailureOr<Value> matvecRes = e.matvec();
+  if (succeeded(matvecRes)) {
+    return matvecRes;
+  }
+
+  return failure();
+}
 
 /// Progressively lower a `vector.contract %a, %b, %c` with row-major matmul
 /// semantics to a reduction_size-unrolled sequence:
@@ -1380,6 +1566,8 @@ void mlir::vector::populateVectorContractLoweringPatterns(
   if (!disableOuterProductLowering)
     patterns.add<OuterProductOpLowering>(patterns.getContext(), benefit);
   patterns.add<ContractionOpLowering, ContractionOpToMatmulOpLowering,
+               ContractionOpToVdotIntrinsicOpLowering, /*added for the v_dot
+                                                          intrinsic hack*/
                ContractionOpToOuterProductOpLowering>(
       options, patterns.getContext(), benefit);
 }
