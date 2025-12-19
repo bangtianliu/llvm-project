@@ -2703,8 +2703,77 @@ struct SliceReturnTypeCanonicalizer {
                               ArrayRef<OpFoldResult> mixedOffsets,
                               ArrayRef<OpFoldResult> mixedSizes,
                               ArrayRef<OpFoldResult> mixedStrides) {
-    return ExtractSliceOp::inferCanonicalRankReducedResultType(
-        op.getType().getRank(), op.getSourceType(), mixedSizes);
+    RankedTensorType originalResultType = op.getType();
+    RankedTensorType sourceType = op.getSourceType();
+    unsigned resultRank = originalResultType.getRank();
+    unsigned sourceRank = sourceType.getRank();
+
+    // Get the new static sizes from mixedSizes.
+    SmallVector<int64_t> newSizes;
+    for (OpFoldResult ofr : mixedSizes) {
+      if (auto val = getConstantIntValue(ofr))
+        newSizes.push_back(*val);
+      else
+        newSizes.push_back(ShapedType::kDynamic);
+    }
+
+    // Count how many unit dimensions exist in the new sizes.
+    // Only apply the fix when there are multiple unit dims that could be
+    // ambiguously dropped (the bug case).
+    unsigned numUnitDims = llvm::count(newSizes, 1);
+    unsigned numDimsToDrop = sourceRank - resultRank;
+
+    // If there's no ambiguity (numUnitDims <= numDimsToDrop), or no rank
+    // reduction, fall back to the original behavior.
+    if (resultRank == sourceRank || numUnitDims <= numDimsToDrop) {
+      return ExtractSliceOp::inferCanonicalRankReducedResultType(
+          op.getType().getRank(), op.getSourceType(), mixedSizes);
+    }
+
+    // For the ambiguous case (multiple unit dims, need to preserve which ones
+    // were dropped): determine which source dimensions were dropped in the
+    // original operation by matching source and result shapes.
+    ArrayRef<int64_t> srcShape = sourceType.getShape();
+    ArrayRef<int64_t> resultShape = originalResultType.getShape();
+
+    // Track which source dimensions were dropped.
+    SmallVector<bool> isDropped(sourceRank, false);
+    unsigned srcIdx = 0, resIdx = 0;
+    while (srcIdx < sourceRank && resIdx < resultRank) {
+      int64_t srcDim = srcShape[srcIdx];
+      int64_t resDim = resultShape[resIdx];
+
+      // A dimension can only be dropped if it's a unit dimension (size 1).
+      bool canBeDropped = (srcDim == 1);
+      bool dimsMatch = (srcDim == resDim) || (srcDim == ShapedType::kDynamic) ||
+                       (resDim == ShapedType::kDynamic);
+
+      if (canBeDropped && !dimsMatch) {
+        // This unit dimension was dropped in the original.
+        isDropped[srcIdx] = true;
+        srcIdx++;
+      } else {
+        // This dimension was kept.
+        srcIdx++;
+        resIdx++;
+      }
+    }
+    // Mark any remaining source dims as dropped.
+    while (srcIdx < sourceRank) {
+      isDropped[srcIdx] = true;
+      srcIdx++;
+    }
+
+    // Build the new result shape using the same drop pattern.
+    SmallVector<int64_t> newResultShape;
+    for (unsigned i = 0; i < sourceRank; ++i) {
+      if (!isDropped[i]) {
+        newResultShape.push_back(newSizes[i]);
+      }
+    }
+
+    return RankedTensorType::get(newResultShape,
+                                 originalResultType.getElementType());
   }
 };
 

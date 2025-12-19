@@ -16,12 +16,14 @@
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/DestinationStyleOpInterface.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/TilingInterface.h"
 #include "mlir/Rewrite/FrozenRewritePatternSet.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -1330,6 +1332,31 @@ getUntiledProducerFromSliceSource(OpOperand *source,
   return {dyn_cast<OpResult>(source->get()), destinationIterArg};
 }
 
+/// Check if the given operation is a broadcast that only broadcasts along
+/// unit dimensions (dimensions with size 1 in the output).
+/// Such broadcasts are essentially no-ops for the data - the output has the
+/// same data as the input, just with extra dimensions of size 1.
+static bool isBroadcastWithUnitDimsOnly(Operation *op) {
+  auto broadcastOp = dyn_cast<linalg::BroadcastOp>(op);
+  if (!broadcastOp)
+    return false;
+
+  // Get the output type and check that all broadcast dimensions have size 1.
+  auto outputType =
+      dyn_cast<RankedTensorType>(broadcastOp.getResult().front().getType());
+  if (!outputType)
+    return false;
+
+  ArrayRef<int64_t> outputShape = outputType.getShape();
+  ArrayRef<int64_t> broadcastDims = broadcastOp.getDimensions();
+
+  // All broadcast dimensions must have size 1 in the output.
+  return llvm::all_of(broadcastDims, [&](int64_t dim) {
+    return dim < static_cast<int64_t>(outputShape.size()) &&
+           outputShape[dim] == 1;
+  });
+}
+
 /// Implementation of fusing producer of a single slice by computing the
 /// slice of the producer in-place.
 std::optional<scf::SCFFuseProducerOfSliceResult>
@@ -1343,6 +1370,10 @@ mlir::scf::tileAndFuseProducerOfSlice(
                                         loops);
   if (!fusableProducer)
     return std::nullopt;
+
+  Operation *fusableProducerOp = fusableProducer.getOwner();
+  bool isBroadcastUnitDim = isBroadcastWithUnitDimsOnly(fusableProducerOp);
+
   unsigned resultNumber = fusableProducer.getResultNumber();
 
   OpBuilder::InsertionGuard g(rewriter);
@@ -1351,7 +1382,154 @@ mlir::scf::tileAndFuseProducerOfSlice(
   // 2. Clone the fused producer
   // 2a. Compute the destination operands to use for the cloned operation.
   SmallVector<Value> origDestinationTensors, clonedOpDestinationTensors;
-  Operation *fusableProducerOp = fusableProducer.getOwner();
+
+  if (isBroadcastUnitDim &&
+      isa<DestinationStyleOpInterface>(fusableProducerOp)) {
+    // For broadcast with unit dims only, use the 2D source as destination.
+    // Skip the broadcast and work directly with the 2D input.
+    auto broadcastOp = cast<linalg::BroadcastOp>(fusableProducerOp);
+    Value broadcastInput = broadcastOp.getInput();
+
+    // Create a new 2D extract_slice from broadcastInput.
+    // The original candidateSliceOp has 3D indexing, we need 2D indexing.
+    ArrayRef<int64_t> bcDims = broadcastOp.getDimensions();
+
+    SmallVector<OpFoldResult> oldOffsets = candidateSliceOp.getMixedOffsets();
+    SmallVector<OpFoldResult> oldSizes = candidateSliceOp.getMixedSizes();
+    SmallVector<OpFoldResult> oldStrides = candidateSliceOp.getMixedStrides();
+
+    // Remove the broadcast dimensions to get 2D indexing.
+    SmallVector<OpFoldResult> newOffsets, newSizes, newStrides;
+    for (int64_t i = 0, e = oldOffsets.size(); i < e; ++i) {
+      if (!llvm::is_contained(bcDims, i)) {
+        newOffsets.push_back(oldOffsets[i]);
+        newSizes.push_back(oldSizes[i]);
+        newStrides.push_back(oldStrides[i]);
+      }
+    }
+
+    // Determine the source for the new 2D extract_slice.
+    Value sliceSource = broadcastInput;
+
+    // Update the loop's iter_arg to use 2D type if this is a destination
+    // operand.
+    if (destinationInitArg &&
+        isa<DestinationStyleOpInterface>(fusableProducerOp) && !loops.empty()) {
+      unsigned operandNumber = destinationInitArg.value()->getOperandNumber();
+      // Use broadcastInput directly (e.g., the fill result), not the
+      // destination tensor. This preserves any initialization (like fill).
+      Value newInitValue = broadcastInput;
+
+      // Update the loop's init operand to the 2D value.
+      loops.front()->getOpOperands()[operandNumber].set(newInitValue);
+
+      // Update the corresponding block argument type to match.
+      if (auto forallOp =
+              dyn_cast<scf::ForallOp>(loops.front().getOperation())) {
+        unsigned numIVs = forallOp.getInductionVars().size();
+        unsigned numOutputs = forallOp.getNumResults();
+        unsigned firstOutputOperandIdx =
+            forallOp->getNumOperands() - numOutputs;
+        unsigned outputIdx = operandNumber - firstOutputOperandIdx;
+
+        if (outputIdx < numOutputs) {
+          BlockArgument blockArg =
+              forallOp.getRegion().front().getArgument(numIVs + outputIdx);
+          blockArg.setType(newInitValue.getType());
+
+          // Use block arg as source for the new slice inside the loop.
+          sliceSource = blockArg;
+
+          // Update the result type of the forall op.
+          OpResult forallResult =
+              cast<OpResult>(forallOp->getResult(outputIdx));
+          forallResult.setType(newInitValue.getType());
+
+          // Update tensor.extract_slice ops in the loop body that use blockArg.
+          // Skip candidateSliceOp since we handle it separately below.
+          ArrayRef<int64_t> bcDimsRef = broadcastOp.getDimensions();
+          SmallVector<tensor::ExtractSliceOp> extractOpsToUpdate;
+          forallOp.getBody()->walk([&](tensor::ExtractSliceOp extractOp) {
+            if (extractOp.getSource() == blockArg &&
+                extractOp != candidateSliceOp) {
+              extractOpsToUpdate.push_back(extractOp);
+            }
+          });
+
+          for (tensor::ExtractSliceOp extractOp : extractOpsToUpdate) {
+            SmallVector<OpFoldResult> oldOffsets = extractOp.getMixedOffsets();
+            SmallVector<OpFoldResult> oldSizes = extractOp.getMixedSizes();
+            SmallVector<OpFoldResult> oldStrides = extractOp.getMixedStrides();
+
+            SmallVector<OpFoldResult> newOffsets, newSizes, newStrides;
+            for (int64_t i = 0, e = oldOffsets.size(); i < e; ++i) {
+              if (!llvm::is_contained(bcDimsRef, i)) {
+                newOffsets.push_back(oldOffsets[i]);
+                newSizes.push_back(oldSizes[i]);
+                newStrides.push_back(oldStrides[i]);
+              }
+            }
+
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPoint(extractOp);
+            auto newExtractOp = tensor::ExtractSliceOp::create(
+                rewriter, extractOp.getLoc(), blockArg, newOffsets, newSizes,
+                newStrides);
+            rewriter.replaceOp(extractOp, newExtractOp.getResult());
+          }
+
+          // Update tensor.parallel_insert_slice ops in terminator.
+          SmallVector<tensor::ParallelInsertSliceOp> insertOpsToUpdate;
+          for (Operation &op : forallOp.getTerminator().getYieldingOps()) {
+            if (auto insertOp = dyn_cast<tensor::ParallelInsertSliceOp>(&op)) {
+              if (insertOp.getDest() == blockArg) {
+                insertOpsToUpdate.push_back(insertOp);
+              }
+            }
+          }
+
+          for (tensor::ParallelInsertSliceOp insertOp : insertOpsToUpdate) {
+            SmallVector<OpFoldResult> oldOffsets = insertOp.getMixedOffsets();
+            SmallVector<OpFoldResult> oldSizes = insertOp.getMixedSizes();
+            SmallVector<OpFoldResult> oldStrides = insertOp.getMixedStrides();
+
+            SmallVector<OpFoldResult> newOffsets, newSizes, newStrides;
+            for (int64_t i = 0, e = oldOffsets.size(); i < e; ++i) {
+              if (!llvm::is_contained(bcDimsRef, i)) {
+                newOffsets.push_back(oldOffsets[i]);
+                newSizes.push_back(oldSizes[i]);
+                newStrides.push_back(oldStrides[i]);
+              }
+            }
+
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPoint(insertOp);
+            tensor::ParallelInsertSliceOp::create(
+                rewriter, insertOp.getLoc(), insertOp.getSource(), blockArg,
+                newOffsets, newSizes, newStrides);
+            rewriter.eraseOp(insertOp);
+          }
+        }
+      }
+    }
+
+    // Create the 2D extract_slice using the determined source (block arg if
+    // inside loop, broadcastInput otherwise).
+    tensor::ExtractSliceOp bcClonedCandidateSliceOp =
+        tensor::ExtractSliceOp::create(rewriter, candidateSliceOp.getLoc(),
+                                       sliceSource, newOffsets, newSizes,
+                                       newStrides);
+
+    // Note: Do not delete the candidateSliceOp, since it's passed in from the
+    // caller. Replace uses and let the original become dead code.
+    rewriter.replaceAllUsesWith(candidateSliceOp,
+                                bcClonedCandidateSliceOp.getResult());
+
+    return scf::SCFFuseProducerOfSliceResult{
+        fusableProducer, bcClonedCandidateSliceOp.getResult(),
+        /*tiledOps=*/{}, /*generatedSlices=*/{bcClonedCandidateSliceOp}};
+  }
+
   if (isa<DestinationStyleOpInterface>(fusableProducerOp) &&
       failed(tensor::getOrCreateDestinations(
           rewriter, fusableProducerOp->getLoc(), fusableProducerOp,
